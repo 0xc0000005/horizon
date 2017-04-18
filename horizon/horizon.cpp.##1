@@ -1,0 +1,125 @@
+#include "stdafx.h"
+
+#include "opencv2/opencv.hpp"
+
+int main()
+{
+    ////cv::VideoCapture cap("D:\\formoza\\RU.32.04_1491981025_193.mp4");
+    //cv::VideoCapture cap("D:\\formoza\\RU.59.08_1491964293_572.mp4");
+    ////cv::VideoCapture cap("D:\\formoza\\RU.59.08_1491984900_735.mp4");
+    //cv::VideoCapture cap("D:\\formoza\\RU.60.35_1491977122_611.mp4");
+    cv::VideoCapture cap("D:\\formoza\\RU.60.37_1491979559_562.mp4");
+
+    if (!cap.isOpened()) {
+        std::cout << "Cannot open video!\n";
+        return -1;
+    }
+
+    //int frames = cap.get(cv::CAP_PROP_FRAME_COUNT);
+    auto fps = cap.get(cv::CAP_PROP_FPS);
+    int delay = static_cast<int>(1000 / fps);
+    const int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    const int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+
+    cv::Mat frame;
+    typedef unsigned long PointVal_t;
+    PointVal_t max = static_cast<PointVal_t>(-1) >> 1;
+    PointVal_t left = 0;
+    PointVal_t right = 0;
+    unsigned int counter = 0;
+    while (cap.read(frame)) {
+        cv::Mat frame_gray;
+        cv::Mat edges;
+
+        //cv::blur(frame, frame, cv::Size(3, 3));
+
+        // remove blue channel (frame is in BGR format)
+        //cv::Mat channels[3];
+        //cv::split(frame, channels);
+        //channels[0] = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+        //cv::merge(channels, 3, frame);
+        
+        if (true)
+        {
+            //cv::Rect r(0, 0, width, height / 2);
+            //cv::Mat3b roi(frame(r));
+            //cv::cvtColor(roi, frame_gray, cv::COLOR_BGR2GRAY);
+            cv::Mat g_channel;
+            cv::extractChannel(frame, frame_gray, 1); // BGR
+        }
+        else {
+            cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
+        }
+
+        // calculate mean color of image's top 20% (and strip 20 pixels above containing timeline)
+        cv::Rect r(0, 20, width, height / 5);
+        cv::Mat1b roi(frame_gray(r));
+        cv::Scalar mean = cv::mean(roi);
+
+        //cv::extractChannel(frame, channel, 0); // BGR
+        //cv::split(frame, planes);
+        //cv::blur(frame_gray, edges, cv::Size(3, 3));
+
+        auto threshold_hi = cv::threshold(frame_gray, frame_gray, mean[0] * 0.9f, 255, cv::THRESH_BINARY);
+        auto threshold_lo = threshold_hi / 2;
+        cv::Canny(frame_gray, edges, threshold_lo, threshold_hi, 3, true);
+        //cv::Sobel(edges, edges, CV_8U, 0, 1);
+
+        const float PI = 3.1415926f;
+        std::vector<cv::Vec2f> lines;
+        cv::HoughLines(edges, lines, 1, PI / 180.0f, 100);
+        for (auto it : lines) {
+            float rho = it[0];
+            float theta = it[1];
+            if (abs(PI / 2.0f - theta) < PI / 18.0f) { // 80-90 degrees
+                int pt1 = static_cast<int>(rho / sin(theta));
+                int pt2 = static_cast<int>((rho - width * cos(theta)) / sin(theta));
+                if (/*abs(pt1 - pt2) < 20 &&*/ pt1 < height / 2 && pt2 < height / 2 && pt1 > height / 20 && pt2 > height / 20) {
+
+                    {
+                        cv::Point p1(0, pt1);
+                        cv::Point p2(width, pt2);
+                        cv::line(frame, p1, p2, cv::Scalar{ 64,64,64,64 }, 1);
+                    }
+
+                    left += pt1;
+                    right += pt2;
+                    ++counter;
+
+                }
+            }
+        }
+        if (counter) {
+            if (counter > 50) {
+                left /= 2;
+                right /= 2;
+                counter /= 2;
+            }
+
+            cv::Point pt1(0, left / counter);
+            cv::Point pt2(width, right / counter);
+            cv::line(frame, pt1, pt2, cv::Scalar{ 0,0,255,0 }, 2);
+        }
+
+        //std::vector<std::vector<cv::Point> > contours;
+        //std::vector<cv::Vec4i> hierarchy;
+        //cv::findContours(edges, contours, hierarchy, CV_RETR_CCOMP, CV_CHAIN_APPROX_SIMPLE);
+        //for (int i = 0; i < contours.size(); i++) {
+        //}
+
+        cv::Mat sum_frame;
+        cv::cvtColor(edges, edges, cv::COLOR_GRAY2BGR);
+        cv::addWeighted(frame, 0.75, edges, 0.25, 0.0, sum_frame);
+
+        //cv::imshow("Horizon Detection", frame_gray);
+        cv::imshow("Horizon Detection", sum_frame);
+        //cv::imshow("Horizon Detection", frame);
+        //cv::imshow("Edges", edges);
+        if ((cv::waitKey(5/*delay*/) & 0xFF) == 0x1B)
+            break;
+    }
+
+    cap.release();
+    cv::destroyAllWindows();
+    return 0;
+}
