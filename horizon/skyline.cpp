@@ -10,6 +10,84 @@ typedef struct {
     int counter = 0;
 } LineInfo_t;
 
+typedef std::vector<cv::Point> Contour_t;
+
+typedef struct {
+    Contour_t points;
+    double area;
+} ContourArea_t;
+
+std::vector<ContourArea_t> get_contours(const cv::Mat& img, double thresh)
+{
+    cv::Mat thr_frame;
+    //cv::blur(img, img, cv::Size(3, 3));
+    cv::threshold(img, thr_frame, thresh, 255, cv::THRESH_BINARY);
+
+    //cv::dilate(img, img, cv::Mat());
+    //cv::erode(img, img, cv::Mat());
+
+    std::vector<Contour_t> contours;
+    std::vector<cv::Vec4i> hierarchy;
+    cv::findContours(
+        thr_frame,
+        contours,
+        hierarchy,
+        cv::RETR_EXTERNAL,
+        //cv::CHAIN_APPROX_TC89_KCOS
+        //cv::CHAIN_APPROX_TC89_L1
+        cv::CHAIN_APPROX_SIMPLE
+    );
+
+    if (contours.empty())
+        return std::vector<ContourArea_t>{};
+
+    // caclculate areas
+    std::vector<ContourArea_t> areas;
+    std::transform(contours.begin(), contours.end(), std::back_inserter(areas),
+        [](const auto& contour) { return ContourArea_t{ contour, cv::contourArea(contour) }; });
+
+    std::sort(areas.begin(), areas.end(), [](auto a, auto b) { return a.area > b.area; });
+
+    return areas;
+}
+
+Contour_t flatten_contour(Contour_t contour)
+{
+    const int size = contour.size();
+    if (size < 4)
+        return contour;
+
+    // find left and right points
+    int left = 0, right = 0;
+    for (auto i = 0; i < size; ++i) {
+        auto x = contour[i].x;
+        auto y = contour[i].y;
+        if (x == contour[left].x && y > contour[left].y)
+            left = i;
+        if (x < contour[left].x)
+            left = i;
+        if (x == contour[right].x && y > contour[right].y)
+            right = i;
+        if (x > contour[right].x)
+            right = i;
+    }
+
+    // remove point above left and right
+    Contour_t flat_contour;
+    flat_contour.push_back(cv::Point{ contour[left].x, 0 });
+    do {
+        flat_contour.push_back(contour[left]);
+        ++left;
+        if (left < 0)
+            left = size - 1;
+        if (left == size)
+            left = 0;
+    } while (left <= right);
+    flat_contour.push_back(cv::Point{ contour[left].x, 0 });
+
+    return flat_contour;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -25,121 +103,58 @@ int main(int argc, char** argv)
     }
 
     std::cerr << "Press Escape to exit" << std::endl;
-    std::cerr << "Press x to toggle frame delay" << std::endl;
+    std::cerr << "Press x to toggle frame delay (delay skipped by default)" << std::endl;
 
     const int width = static_cast<int>(cap.get(CV_CAP_PROP_FRAME_WIDTH));
     const int height = static_cast<int>(cap.get(CV_CAP_PROP_FRAME_HEIGHT));
     auto fps = cap.get(CV_CAP_PROP_FPS);
     int frame_delay = static_cast<int>(1000 / fps);
 
-    cv::Mat frame;
-    std::list<LineInfo_t> buffer;
-    LineInfo_t skyline;
-    const int max_size = 20;
-
     auto last_frame_moment = std::chrono::steady_clock::now();
-    bool skip_delay = false;
+    bool skip_delay = true;
 
+    cv::Mat frame;
     while (cap.read(frame)) {
 
         //cv::pyrMeanShiftFiltering(frame, frame_gray, 10, 10, 1);
         cv::Mat frame_gray = frame;
         cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
 
-        cv::dilate(frame_gray, frame_gray, cv::Mat());
-        cv::blur(frame_gray, frame_gray, cv::Size(9, 9));
-        cv::erode(frame_gray, frame_gray, cv::Mat());
-        
-        // calculate mean color of image's top 20% (and strip 40 pixels above containing timeline)
-        cv::Rect mean_rect(0, 40, width, height / 5);
-        cv::Scalar mean = cv::mean(cv::Mat1b{ frame_gray(mean_rect) });
+        // take upper 50% of frame to improve performance
+        cv::Rect roi(0, 0, width, height / 2);
+        frame_gray = cv::Mat1b{ frame_gray(roi) };
+       
+        // calculate mean color of image's top 10%-30%
+        cv::Rect mean_rect(0, height / 10, width, height / 3);
+        double mean = cv::mean(cv::Mat1b{ frame_gray(mean_rect) })[0];
+        if (mean > 170.0f)
+            mean *= 0.9f;
+        if (mean > 200.0f)
+            mean *= 0.8f;
 
-        cv::threshold(frame_gray, frame_gray, mean[0] * 0.9f, 255, cv::THRESH_BINARY);
-        cv::Mat edges;
-        cv::Canny(frame_gray, edges, 100, 200, 3, true);
+        auto contours = get_contours(frame_gray, mean);
+        cv::Mat zeros = cv::Mat::zeros(frame.size(), CV_8UC3);
+        for (const auto& contour : contours) {
+            auto rect = cv::boundingRect(contour.points);
+            if (rect.x < width / 5) {
+                auto points = flatten_contour(contour.points);
 
-        std::vector<cv::Vec2f> lines;
-        cv::HoughLines(edges, lines, 1, CV_PI / 180.0f, 150);
+                cv::Mat skyline = cv::Mat::zeros(frame.size(), CV_8UC3);
+                cv::drawContours(skyline, std::vector<Contour_t>{points}, 0, cv::Scalar(0,0,255), CV_FILLED);
+                cv::drawContours(skyline, std::vector<Contour_t>{points}, 0, cv::Scalar(0, 0, 0), CV_FILLED, 8, cv::noArray(), INT_MAX, cv::Point{0, -2});
 
-        // filter lines to be close to PI/2 and to be in above 10%-50% range of image
-        lines.erase(std::remove_if(lines.begin(),
-                                   lines.end(),
-                                   [=](cv::Vec2f v) {
-                float r = v[0];
-                float t = v[1];
-                return abs(CV_PI / 2 - t) > CV_PI / 32 || r < height / 5 || r > height / 2;
-            }), lines.end());
+                cv::Mat mask = cv::Mat::zeros(frame.size(), CV_8UC1);
+                cv::drawContours(mask, std::vector<Contour_t>{points}, 0, cv::Scalar(255), CV_FILLED);
+                cv::drawContours(mask, std::vector<Contour_t>{points}, 0, cv::Scalar(0), CV_FILLED, 8, cv::noArray(), INT_MAX, cv::Point{ 0, -2 });
 
-        if (!lines.empty()) {
+                cv::bitwise_and(frame, zeros, frame, mask);
+                cv::bitwise_or(frame, skyline, frame, mask);
 
-            // cluster lines
-            std::vector<int> labels;
-            float msx_distance = 30;
-            cv::partition(lines, labels, [=](const cv::Vec2f& a, const cv::Vec2f b) { return abs(a[0] - b[0]) < msx_distance; });
-            // map clustered lines by labels
-            std::map<int, LineInfo_t> clusters;
-            int index = 0;
-            for (auto& label : labels) {
-                auto it = clusters.find(label);
-                auto elm = it == clusters.end() ? LineInfo_t() : it->second;
-                elm.r += lines[index][0];
-                elm.t += lines[index][1];
-                ++elm.counter;
-                ++index;
-                clusters[label] = elm;
+                break;
             }
-            // map to vector and calculate mean values
-            std::vector<LineInfo_t> lines_vec;
-            std::transform(clusters.begin(),
-                clusters.end(),
-                std::back_inserter(lines_vec),
-                [](auto v) {
-                auto elm = v.second;
-                elm.r /= elm.counter;
-                elm.t /= elm.counter;
-                return elm; });
-
-            // init skyline with firts 20 most populated clusters (can be a bad idea but I don't have another)
-            if (buffer.size() < max_size) {
-                auto max_cluster = std::max_element(lines_vec.begin(),
-                                                    lines_vec.end(),
-                                                    [](auto a, auto b) { return a.counter > b.counter; });
-                buffer.push_back(*max_cluster);
-            }
-            // find nearest cluster
-            else {
-                float min_distance = static_cast<float>(height);
-                LineInfo_t* nearest = nullptr;
-                for (auto& elm : lines_vec) {
-                    float distance = abs(elm.r - skyline.r);
-                    if (distance <= min_distance) {
-                        min_distance = distance;
-                        nearest = &elm;
-                    }
-                }
-                buffer.push_back(*nearest);
-                buffer.pop_front();
-            }
-
-            skyline = std::accumulate(buffer.begin(),
-                                      buffer.end(),
-                                      LineInfo_t(),
-                                      [](auto a, auto b) { a.r += b.r; a.t += b.t; return a; });
-            skyline.r /= buffer.size();
-            skyline.t /= buffer.size();
         }
 
-        cv::Point p1(0, static_cast<int>(skyline.r / sin(skyline.t)));
-        cv::Point p2(width, static_cast<int>((skyline.r - width * cos(skyline.t)) / sin(skyline.t)));
-        cv::line(frame, p1, p2, cv::Scalar{ 0,0,255,255 }, 1);
-
-        //cv::Mat sum_frame;
-        //cv::cvtColor(edges, edges, cv::COLOR_GRAY2BGR);
-        //cv::addWeighted(frame, 0.75, edges, 0.25, 0.0, sum_frame);
-
         cv::imshow("Horizon Detection", frame);
-        //cv::imshow("Horizon Detection", frame_gray);
-        //cv::imshow("Horizon Detection", sum_frame);
 
         auto current_time = std::chrono::steady_clock::now();
         int delay = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_frame_moment).count());
